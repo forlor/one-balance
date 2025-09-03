@@ -66,6 +66,12 @@ async function main() {
         config.vars.CONSECUTIVE_429_THRESHOLD = consecutive429Threshold
     }
 
+    const aiGateway = process.env.AI_GATEWAY
+    if (aiGateway) {
+        console.log(`Setting AI_GATEWAY to '${aiGateway}'...`)
+        config.vars.AI_GATEWAY = aiGateway
+    }
+
     // TODO: auto create ai gateway when wrangler supports it
 
     console.log('Checking for D1 databases...')

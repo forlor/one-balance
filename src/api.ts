@@ -264,8 +264,10 @@ async function makeGatewayRequest(
     const newHeaders = new Headers(headers)
     setAuthHeader(newHeaders, restResource, key)
 
-    // TODO: may use url from env directly for low latency.
-    let base = await env.AI.gateway(env.AI_GATEWAY).getUrl()
+    const gateways = env.AI_GATEWAY.split(',').map(s => s.trim())
+    const selected = gateways[Math.floor(Math.random() * gateways.length)]
+
+    let base = await env.AI.gateway(selected).getUrl()
     if (!base.endsWith('/')) {
         base += '/'
     }
