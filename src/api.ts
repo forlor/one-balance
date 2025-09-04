@@ -335,13 +335,35 @@ async function analyze429CooldownSeconds(
     if (count >= Number(env.CONSECUTIVE_429_THRESHOLD)) {
         consecutive429Count.delete(key)
         console.error(`key ${key} triggered long cooldown after ${env.CONSECUTIVE_429_THRESHOLD} consecutive 429s`)
-        return provider === 'google-ai-studio' ? util.getSecondsUntilMidnightPT() : 24 * 60 * 60
+        return untilResetForDay(provider)
     }
 
-    if (provider !== 'google-ai-studio') {
-        return 65
+    return untilReset(respFromGateway, provider)
+}
+
+function untilResetForDay(provider: string): number {
+    if (provider === 'google-ai-studio') {
+        return util.getSecondsUntilMidnightPT()
+    }
+    if (provider === 'openrouter') {
+        return util.getSecondsUntilMidnightUTC()
     }
 
+    return 24 * 60 * 60
+}
+
+async function untilReset(respFromGateway: Response, provider: string): Promise<number> {
+    if (provider === 'google-ai-studio') {
+        return untilResetForGoogleAiStudio(respFromGateway)
+    }
+    if (provider === 'openrouter') {
+        return untilResetForOpenrouter(respFromGateway)
+    }
+
+    return 65
+}
+
+async function untilResetForGoogleAiStudio(respFromGateway: Response): Promise<number> {
     try {
         const errorBody = await respFromGateway.clone().json()
         const quotaFailureDetail = getGoogleAiStudioErrorDetail(
@@ -363,9 +385,25 @@ async function analyze429CooldownSeconds(
             return retrySeconds + 2 // 2 seconds buffer
         }
     } catch (error) {
-        console.error('failed to parse 429 response, fallback to 65 seconds', error)
+        console.error('failed to parse google-ai-studio 429 response, fallback to 65 seconds', error)
     }
+    return 65
+}
 
+async function untilResetForOpenrouter(respFromGateway: Response): Promise<number> {
+    try {
+        const resetHeader = respFromGateway.headers.get('X-RateLimit-Reset')
+        if (resetHeader) {
+            const resetTime = parseInt(resetHeader)
+            const now = Date.now()
+            if (resetTime > now) {
+                const cooldownSeconds = Math.floor((resetTime - now) / 1000) + 5
+                return cooldownSeconds
+            }
+        }
+    } catch (error) {
+        console.error('failed to parse openrouter 429 response, fallback to 65 seconds', error)
+    }
     return 65
 }
 

@@ -148,3 +148,11 @@ export function getSecondsUntilMidnightPT(): number {
     const secondsPassed = hour * 3600 + minute * 60 + second
     return 24 * 60 * 60 - secondsPassed
 }
+
+export function getSecondsUntilMidnightUTC(): number {
+    const now = new Date()
+    const utcMidnight = new Date(now)
+    utcMidnight.setUTCDate(utcMidnight.getUTCDate() + 1)
+    utcMidnight.setUTCHours(0, 0, 0, 0)
+    return Math.floor((utcMidnight.getTime() - now.getTime()) / 1000)
+}
