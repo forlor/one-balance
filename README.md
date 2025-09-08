@@ -11,7 +11,20 @@
 
 **赞助项目可以领取 Gemini Key**
 
-<a href="https://afdian.com/a/glidea"><img src="images/sponsor.png" width="500"></a>
+<table>
+  <tr>
+    <td align="center">
+      <img src="https://github.com/glidea/zenfeed/blob/main/docs/images/wechat.png?raw=true" alt="Wechat QR Code" width="300">
+      <br>
+      <strong>AI 学习交流社群</strong>
+    </td>
+    <td align="center">
+      <img src="https://github.com/glidea/zenfeed/blob/main/docs/images/sponsor.png?raw=true" width="500">
+      <br>
+      <strong><a href="https://afdian.com/a/glidea">请杯奶茶 🧋</a></strong>
+    </td>
+  </tr>
+</table>
 <br/>
 <a href="https://afdian.com/a/glidea">赞助项目，支持发展</a>
 
