@@ -10,7 +10,10 @@ const PROVIDER_CUSTOM_AUTH_HEADER: Record<string, string> = {
     cartesia: 'X-API-Key'
 }
 
-function getAuthHeaderName(provider: string): string {
+function getAuthHeaderName(provider: string, restResource?: string): string {
+    if (provider === 'google-ai-studio' && restResource?.includes('/openai/')) {
+        return 'Authorization'
+    }
     return PROVIDER_CUSTOM_AUTH_HEADER[provider] || 'Authorization'
 }
 
@@ -19,7 +22,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext):
     const restResource = url.pathname.substring('/api/'.length) + url.search
 
     const provider = restResource.split('/')[0]
-    const authKey = getAuthKey(request, provider, url)
+    const authKey = getAuthKey(request, provider, url, restResource)
     const realProviderAndModel = await extractRealProviderAndModel(request, restResource, provider)
     if (!realProviderAndModel) {
         return new Response('Not supported request: valid provider or model not found', { status: 400 })
@@ -214,7 +217,7 @@ async function forward(
     return new Response('Internal server error after retries', { status: 500 })
 }
 
-function getAuthKey(request: Request, provider: string, url: URL): string {
+function getAuthKey(request: Request, provider: string, url: URL, restResource?: string): string {
     if (provider === 'google-ai-studio') {
         // try to get auth key from query params
         const key = url.searchParams.get('key')
@@ -223,11 +226,11 @@ function getAuthKey(request: Request, provider: string, url: URL): string {
         }
     }
 
-    return getAuthKeyFromHeader(request, provider)
+    return getAuthKeyFromHeader(request, provider, restResource)
 }
 
-function getAuthKeyFromHeader(request: Request, provider: string): string {
-    const h = getAuthHeaderName(provider)
+function getAuthKeyFromHeader(request: Request, provider: string, restResource?: string): string {
+    const h = getAuthHeaderName(provider, restResource)
     let v = request.headers.get(h)
 
     // 如果自定义头部没有值，且自定义头部不是 'Authorization'，则尝试从 'Authorization' 头部获取
@@ -338,7 +341,7 @@ function setAuthHeader(headers: Headers, restResource: string, key: string) {
     const provider = restResource.split('/')[0]
 
     let v = key
-    const h = getAuthHeaderName(provider)
+    const h = getAuthHeaderName(provider, restResource)
     if (h == 'Authorization') {
         v = `Bearer ${key}`
     } else {
