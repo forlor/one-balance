@@ -197,13 +197,24 @@ async function forward(
             case 502:
             case 503:
             case 504:
-                console.error(`gateway returned 5xx ${await respFromGateway.text()}`)
+                const serverErrorText = await Promise.race([
+                    respFromGateway.clone().text(),
+                    new Promise<string>(resolve => setTimeout(() => resolve('<timeout reading body>'), 1000))
+                ]).catch(() => '')
+
+                console.error(`gateway returned ${status} ${serverErrorText}`)
+
+                // 剔除当前故障 Key，确保下一次重试尝试其他 Key
+                const errorIndex = activeKeys.indexOf(selectedKey)
+                if (errorIndex !== -1) {
+                    activeKeys.splice(errorIndex, 1)
+                }
 
                 // Wait with a longer exponential backoff before retrying on server errors (starting at 500ms, scaling by 2x, max 10s)
                 const serverErrorBackoffMs = Math.min(500 * Math.pow(2, i), 10000)
                 await new Promise(resolve => setTimeout(resolve, serverErrorBackoffMs))
 
-                continue // no backoff, just retry...
+                continue
         }
 
         if (respFromGateway.ok) {
