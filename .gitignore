@@ -209,6 +209,5 @@ vite.config.ts.timestamp-*
 
 # Custom
 src/service/d1/migrations/
-docs/
 worker-configuration.d.ts
 wrangler.jsonc

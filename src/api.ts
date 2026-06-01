@@ -19,7 +19,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext):
     const restResource = url.pathname.substring('/api/'.length) + url.search
 
     const provider = restResource.split('/')[0]
-    const authKey = getAuthKey(request, provider)
+    const authKey = getAuthKey(request, provider, url)
     const realProviderAndModel = await extractRealProviderAndModel(request, restResource, provider)
     if (!realProviderAndModel) {
         return new Response('Not supported request: valid provider or model not found', { status: 400 })
@@ -62,12 +62,17 @@ async function extractRealProviderAndModel(
 }
 
 async function extractModel(request: Request, restResource: string): Promise<string | null> {
+    const pathModel = extractModelFromPath(restResource)
+    if (pathModel) {
+        return pathModel
+    }
+
     if (request.method === 'POST' && request.body) {
         const model = await extractModelFromBody(request)
         if (model) return model
     }
 
-    return extractModelFromPath(restResource)
+    return null
 }
 
 async function extractModelFromBody(request: Request): Promise<string | null> {
@@ -96,13 +101,17 @@ async function forward(
     provider: string,
     model: string
 ): Promise<Response> {
-    const activeKeys = await keyService.listActiveKeysViaCache(env, provider)
-    if (activeKeys.length === 0) {
+    const cachedKeys = await keyService.listActiveKeysViaCache(env, provider)
+    if (cachedKeys.length === 0) {
         return new Response('No active keys available', { status: 503 })
     }
 
+    // Shallow copy the array so we can safely splice/remove items locally during retries
+    // without altering the cached list structure for other requests.
+    const activeKeys = [...cachedKeys]
+
     const body = request.body ? await request.arrayBuffer() : null
-    const MAX_RETRIES = 30
+    const MAX_RETRIES = Number(env.MAX_RETRIES) || 4
     for (let i = 0; i < MAX_RETRIES; i++) {
         if (activeKeys.length === 0) {
             return new Response('No active keys available', { status: 503 })
@@ -129,15 +138,25 @@ async function forward(
             // key is invalid, then continue to block and next key
             case 401:
             case 403:
-                ctx.waitUntil(keyService.setKeyStatus(env, provider, selectedKey.id, 'blocked'))
+                const errorText = await respFromGateway
+                    .clone()
+                    .text()
+                    .catch(() => '')
+                const isLocationError =
+                    errorText.toLowerCase().includes('location') || errorText.toLowerCase().includes('supported')
 
-                // next key
-                console.error(
-                    `key ${selectedKey.key} is blocked due to ${respFromGateway.status} ${await respFromGateway.text()}`
-                )
-                if (activeKeys.length < 500) {
-                    // save the CPU time for Cloudflare Free plan
-                    activeKeys.splice(activeKeys.indexOf(selectedKey), 1)
+                if (isLocationError) {
+                    console.warn(
+                        `key ${selectedKey.key} got 403 location error (unsupported region in Cloudflare egress node), skipping database block.`
+                    )
+                } else {
+                    ctx.waitUntil(keyService.setKeyStatus(env, provider, selectedKey.id, 'blocked'))
+                    console.error(`key ${selectedKey.key} is blocked due to ${respFromGateway.status} ${errorText}`)
+                }
+
+                const blockedIndex = activeKeys.indexOf(selectedKey)
+                if (blockedIndex !== -1) {
+                    activeKeys.splice(blockedIndex, 1)
                 }
                 continue
 
@@ -146,13 +165,29 @@ async function forward(
                 const sec = await analyze429CooldownSeconds(env, respFromGateway, provider, selectedKey.key)
                 ctx.waitUntil(keyService.setKeyModelCooldownIfAvailable(env, selectedKey.id, provider, model, sec))
 
-                // next key
+                // Update the shared key's cooldown state in memory so other concurrent requests hitting the cache see it instantly
+                const now = Date.now() / 1000
+                if (!selectedKey.modelCoolings) {
+                    selectedKey.modelCoolings = {}
+                }
+                selectedKey.modelCoolings[model] = {
+                    end_at: Math.round(now + sec),
+                    total_seconds: (selectedKey.modelCoolings[model]?.total_seconds || 0) + sec
+                }
+
+                // next key (remove from current local retry attempt list)
                 console.warn(
                     `key ${selectedKey.key} is cooling down for model ${model} due to 429 ${await respFromGateway.text()}`
                 )
-                if (activeKeys.length < 500) {
-                    activeKeys.splice(activeKeys.indexOf(selectedKey), 1)
+                const coolingIndex = activeKeys.indexOf(selectedKey)
+                if (coolingIndex !== -1) {
+                    activeKeys.splice(coolingIndex, 1)
                 }
+
+                // Wait with a longer exponential backoff before retrying to prevent hammering the upstream API (starting at 500ms, scaling by 2x, max 10s)
+                const backoffMs = Math.min(500 * Math.pow(2, i), 10000)
+                await new Promise(resolve => setTimeout(resolve, backoffMs))
+
                 continue
 
             case 500:
@@ -160,11 +195,16 @@ async function forward(
             case 503:
             case 504:
                 console.error(`gateway returned 5xx ${await respFromGateway.text()}`)
+
+                // Wait with a longer exponential backoff before retrying on server errors (starting at 500ms, scaling by 2x, max 10s)
+                const serverErrorBackoffMs = Math.min(500 * Math.pow(2, i), 10000)
+                await new Promise(resolve => setTimeout(resolve, serverErrorBackoffMs))
+
                 continue // no backoff, just retry...
         }
 
-        if (status / 100 === 2) {
-            consecutive429Count.delete(selectedKey.id)
+        if (respFromGateway.ok) {
+            consecutive429Count.delete(selectedKey.key)
         } else {
             console.error(`gateway returned ${status}`)
         }
@@ -174,10 +214,10 @@ async function forward(
     return new Response('Internal server error after retries', { status: 500 })
 }
 
-function getAuthKey(request: Request, provider: string): string {
+function getAuthKey(request: Request, provider: string, url: URL): string {
     if (provider === 'google-ai-studio') {
         // try to get auth key from query params
-        const key = new URL(request.url).searchParams.get('key')
+        const key = url.searchParams.get('key')
         if (key) {
             return key
         }
@@ -189,69 +229,60 @@ function getAuthKey(request: Request, provider: string): string {
 function getAuthKeyFromHeader(request: Request, provider: string): string {
     const h = getAuthHeaderName(provider)
     let v = request.headers.get(h)
+
+    // 如果自定义头部没有值，且自定义头部不是 'Authorization'，则尝试从 'Authorization' 头部获取
+    if (!v && h !== 'Authorization') {
+        v = request.headers.get('Authorization')
+    }
+
     if (!v) {
         return ''
     }
 
-    let key = v
-    if (h === 'Authorization') {
-        key = v.replace(/^Bearer\s+/, '')
+    // 如果值是以 Bearer 开头，去掉 Bearer 前缀
+    if (v.startsWith('Bearer ')) {
+        return v.substring(7)
     }
 
-    return key
+    return v
 }
+
+let roundRobinIndex = 0
 
 async function selectKey(keys: schema.Key[], model: string): Promise<schema.Key> {
-    let selectedKey = tryRandomSelect(keys, model) // fast path
-    if (selectedKey) {
-        return selectedKey
-    }
-
-    return selectFromAllKeys(keys, model)
-}
-
-function tryRandomSelect(keys: schema.Key[], model: string): schema.Key | null {
     const now = Date.now() / 1000
-    const maxAttempts = 10
+    const len = keys.length
 
-    for (let i = 0; i < maxAttempts; i++) {
-        const randomKey = keys[Math.floor(Math.random() * keys.length)]
-        const coolingEnd = randomKey.modelCoolings?.[model]?.end_at
+    // 1. Try to find an available (non-cooling) key sequentially (Round-Robin)
+    for (let i = 0; i < len; i++) {
+        const idx = (roundRobinIndex + i) % len
+        const keyCandidate = keys[idx]
+        const coolingEnd = keyCandidate.modelCoolings?.[model]?.end_at
 
         if (!coolingEnd || coolingEnd < now) {
-            console.info(`selected a key ${randomKey.key} to try; count: ${i + 1}`)
-            return randomKey
+            roundRobinIndex = (idx + 1) % len
+            console.info(`selected key sequentially: ${keyCandidate.key}`)
+            return keyCandidate
         }
     }
 
-    return null
-}
-
-function selectFromAllKeys(keys: schema.Key[], model: string): schema.Key {
-    const now = Date.now() / 1000
-    const availableKeys = []
-    let bestCoolingKey: schema.Key | null = null
+    // 2. Fallback: If all keys are cooling down, pick the one with the earliest cooldown end
+    let bestCoolingKey: schema.Key = keys[0]
     let earliestCooldownEnd = Infinity
 
     for (const key of keys) {
-        const coolingEnd = key.modelCoolings?.[model]?.end_at
-        if (!coolingEnd || coolingEnd < now) {
-            availableKeys.push(key)
-        } else if (coolingEnd < earliestCooldownEnd) {
+        const coolingEnd = key.modelCoolings?.[model]?.end_at || 0
+        if (coolingEnd < earliestCooldownEnd) {
             earliestCooldownEnd = coolingEnd
             bestCoolingKey = key
         }
     }
 
-    if (availableKeys.length > 0) {
-        const selectedKey = availableKeys[Math.floor(Math.random() * availableKeys.length)]
-        console.info(`selected available key ${selectedKey.key} after full scan`)
-        return selectedKey
-    }
-
-    console.warn(`selected a cooling key ${bestCoolingKey?.key} to try`)
-    return bestCoolingKey! // may be available actually
+    console.warn(`all keys cooling down, selected best cooling key: ${bestCoolingKey.key}`)
+    return bestCoolingKey
 }
+
+const gatewayUrlCache = new Map<string, string>()
 
 async function makeGatewayRequest(
     method: string,
@@ -265,11 +296,28 @@ async function makeGatewayRequest(
     setAuthHeader(newHeaders, restResource, key)
 
     const selected = selectGateway(env)
-    let base = await env.AI.gateway(selected).getUrl()
+    let base = gatewayUrlCache.get(selected)
+    if (!base) {
+        base = await env.AI.gateway(selected).getUrl()
+        gatewayUrlCache.set(selected, base)
+    }
     if (!base.endsWith('/')) {
         base += '/'
     }
-    const url = `${base}${restResource}`
+
+    // Clean up the 'key' query parameter from restResource to avoid forwarding client/gateway auth key to Gemini
+    let cleanResource = restResource
+    if (restResource.includes('?')) {
+        const [pathPart, searchPart] = restResource.split('?')
+        const params = new URLSearchParams(searchPart)
+        if (params.has('key')) {
+            params.delete('key')
+        }
+        const newSearch = params.toString()
+        cleanResource = newSearch ? `${pathPart}?${newSearch}` : pathPart
+    }
+
+    const url = `${base}${cleanResource}`
 
     return new Request(url, {
         method: method,
@@ -293,6 +341,9 @@ function setAuthHeader(headers: Headers, restResource: string, key: string) {
     const h = getAuthHeaderName(provider)
     if (h == 'Authorization') {
         v = `Bearer ${key}`
+    } else {
+        // 如果上游提供商使用自定义头部，则必须删除原请求中的 Authorization 头部，避免干扰上游认证
+        headers.delete('Authorization')
     }
 
     headers.set(h, v)
@@ -373,7 +424,12 @@ async function untilResetForGoogleAiStudio(respFromGateway: Response): Promise<n
         if (quotaFailureDetail) {
             const violations = quotaFailureDetail.violations || []
             for (const violation of violations) {
-                if (violation.quotaId === 'GenerateRequestsPerDayPerProjectPerModel-FreeTier') {
+                if (
+                    violation.quotaId &&
+                    (violation.quotaId === 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' ||
+                        violation.quotaId.includes('PerDay') ||
+                        violation.quotaId.toLowerCase().includes('day'))
+                ) {
                     return util.getSecondsUntilMidnightPT() // Requests per day (RPD) quotas reset at midnight Pacific time
                 }
             }
@@ -413,7 +469,7 @@ function getGoogleAiStudioErrorDetail(body: any, type: string): any | null {
         errorBody = body[0]
     }
 
-    const details = errorBody.error?.details || []
+    const details = errorBody?.error?.details || []
     for (const detail of details) {
         if (detail['@type'] === type) {
             return detail
