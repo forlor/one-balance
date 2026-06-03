@@ -17,7 +17,8 @@
     "vars": {
         "AUTH_KEY": "my-auth-key",
         "AI_GATEWAY": "one-balance",
-        "CONSECUTIVE_429_THRESHOLD": "2"
+        "CONSECUTIVE_429_THRESHOLD": "2",
+        "MAX_RETRIES": "4"
     },
     "observability": {
         "enabled": true

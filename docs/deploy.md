@@ -65,21 +65,24 @@ pnpm init:config
 
 > **AUTH_KEY 高级配置格式**：
 > `AUTH_KEY="key1=provider1,model1;key2;key3(1758077793)=provider2"`
-> * 使用分号 `;` 分隔多个 Key。
-> * 无限制的 Key（如 `key2`）可以访问所有模型，且只有无限制的 Key 才能登录 Web UI。
-> * 括号内可附加 Unix 时间戳表示过期时间，如 `key3(1758077793)`。
-> * 可以使用 `=` 限制该 Key 只能访问特定 Provider 或 Model。
+>
+> - 使用分号 `;` 分隔多个 Key。
+> - 无限制的 Key（如 `key2`）可以访问所有模型，且只有无限制的 Key 才能登录 Web UI。
+> - 括号内可附加 Unix 时间戳表示过期时间，如 `key3(1758077793)`。
+> - 可以使用 `=` 限制该 Key 只能访问特定 Provider 或 Model。
 
 ### 第五步：部署到 Cloudflare
 
 使用以下命令进行一键部署。部署脚本会自动引导您登录 Cloudflare、创建所需的 D1 数据库、应用数据库迁移并部署 Worker：
 
 #### Mac / Linux 环境：
+
 ```bash
 AUTH_KEY=your-super-secret-auth-key pnpm run deploycf
 ```
 
 #### Windows 环境 (PowerShell)：
+
 ```powershell
 $env:AUTH_KEY = "your-super-secret-auth-key"; pnpm run deploycf
 ```
@@ -94,11 +97,13 @@ $env:AUTH_KEY = "your-super-secret-auth-key"; pnpm run deploycf
 部署脚本会自动处理数据库迁移。如果您后续需要手动管理数据库，可以使用以下命令：
 
 ### 本地开发数据库迁移：
+
 ```bash
 pnpm migrate
 ```
 
 ### 远程生产数据库迁移：
+
 ```bash
 pnpm migrate:remote
 ```

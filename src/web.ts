@@ -92,7 +92,7 @@ function parseKeysRequest(request: Request) {
         provider: providerMatch?.[1] || '',
         q: url.searchParams.get('q') || '',
         status: url.searchParams.get('status') || 'active',
-        page: parseInt(url.searchParams.get('page') || '1', 10),
+        page: Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1),
         pageSize: 20,
         sortBy: url.searchParams.get('sort_by') || '',
         sortOrder: url.searchParams.get('sort_order') || 'desc'
@@ -108,8 +108,8 @@ async function handleKeysPost(
     const action = formData.get('action')
 
     if (action === 'add') {
-        const keysStr = formData.get('keys') as string
-        const remark = formData.get('remark') as string
+        const keysStr = (formData.get('keys') as string) || ''
+        const remark = (formData.get('remark') as string) || ''
         const keys = keysStr
             .split(/[\n,]/)
             .map(k => k.trim())

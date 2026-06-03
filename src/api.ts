@@ -67,15 +67,25 @@ async function extractRealProviderAndModel(
 async function extractModel(request: Request, restResource: string): Promise<string | null> {
     const pathModel = extractModelFromPath(restResource)
     if (pathModel) {
-        return pathModel
+        return sanitizeModelName(pathModel)
     }
 
     if (request.method === 'POST' && request.body) {
         const model = await extractModelFromBody(request)
-        if (model) return model
+        if (model) return sanitizeModelName(model)
     }
 
     return null
+}
+
+function sanitizeModelName(model: string): string {
+    return model.replace(/[^a-zA-Z0-9_\-\.\/:@]/g, '_')
+}
+
+function maskKey(key: string): string {
+    if (!key) return ''
+    if (key.length <= 10) return '***'
+    return `${key.substring(0, 6)}...${key.substring(key.length - 4)}`
 }
 
 async function extractModelFromBody(request: Request): Promise<string | null> {
@@ -141,20 +151,19 @@ async function forward(
             // key is invalid, then continue to block and next key
             case 401:
             case 403:
-                const errorText = await respFromGateway
-                    .clone()
-                    .text()
-                    .catch(() => '')
+                const errorText = await respFromGateway.text().catch(() => '')
                 const isLocationError =
                     errorText.toLowerCase().includes('location') || errorText.toLowerCase().includes('supported')
 
                 if (isLocationError) {
                     console.warn(
-                        `key ${selectedKey.key} got 403 location error (unsupported region in Cloudflare egress node), skipping database block.`
+                        `key ${maskKey(selectedKey.key)} (Remark: ${selectedKey.remark || 'none'}, ID: ${selectedKey.id}) got 403 location error (unsupported region in Cloudflare egress node), skipping database block.`
                     )
                 } else {
                     ctx.waitUntil(keyService.setKeyStatus(env, provider, selectedKey.id, 'blocked'))
-                    console.error(`key ${selectedKey.key} is blocked due to ${respFromGateway.status} ${errorText}`)
+                    console.error(
+                        `key ${maskKey(selectedKey.key)} (Remark: ${selectedKey.remark || 'none'}, ID: ${selectedKey.id}) is blocked due to ${respFromGateway.status} ${errorText}`
+                    )
                 }
 
                 const blockedIndex = activeKeys.indexOf(selectedKey)
@@ -179,16 +188,17 @@ async function forward(
                 }
 
                 // next key (remove from current local retry attempt list)
+                const errBodyText = await respFromGateway.text().catch(() => '')
                 console.warn(
-                    `key ${selectedKey.key} is cooling down for model ${model} due to 429 ${await respFromGateway.text()}`
+                    `key ${maskKey(selectedKey.key)} (Remark: ${selectedKey.remark || 'none'}, ID: ${selectedKey.id}) is cooling down for model ${model} due to 429: ${errBodyText}`
                 )
                 const coolingIndex = activeKeys.indexOf(selectedKey)
                 if (coolingIndex !== -1) {
                     activeKeys.splice(coolingIndex, 1)
                 }
 
-                // Wait with a longer exponential backoff before retrying to prevent hammering the upstream API (starting at 500ms, scaling by 2x, max 10s)
-                const backoffMs = Math.min(500 * Math.pow(2, i), 10000)
+                // Wait with a longer exponential backoff before retrying to prevent hammering the upstream API (starting at 1500ms, scaling by 2x, max 20s)
+                const backoffMs = Math.min(1500 * Math.pow(2, i), 20000)
                 await new Promise(resolve => setTimeout(resolve, backoffMs))
 
                 continue
@@ -197,10 +207,23 @@ async function forward(
             case 502:
             case 503:
             case 504:
-                const serverErrorText = await Promise.race([
-                    respFromGateway.clone().text(),
-                    new Promise<string>(resolve => setTimeout(() => resolve('<timeout reading body>'), 1000))
-                ]).catch(() => '')
+                let timerId: any
+                const timeoutPromise = new Promise<string>(resolve => {
+                    timerId = setTimeout(() => resolve('<timeout reading body>'), 1000)
+                })
+
+                const serverErrorText = await Promise.race([respFromGateway.text(), timeoutPromise]).catch(() => '')
+
+                clearTimeout(timerId)
+
+                if (serverErrorText === '<timeout reading body>') {
+                    try {
+                        const bodyCancelPromise = respFromGateway.body?.cancel().catch(() => {})
+                        if (bodyCancelPromise) {
+                            ctx.waitUntil(bodyCancelPromise)
+                        }
+                    } catch {}
+                }
 
                 console.error(`gateway returned ${status} ${serverErrorText}`)
 
@@ -210,8 +233,8 @@ async function forward(
                     activeKeys.splice(errorIndex, 1)
                 }
 
-                // Wait with a longer exponential backoff before retrying on server errors (starting at 500ms, scaling by 2x, max 10s)
-                const serverErrorBackoffMs = Math.min(500 * Math.pow(2, i), 10000)
+                // Wait with a longer exponential backoff before retrying on server errors (starting at 1500ms, scaling by 2x, max 20s)
+                const serverErrorBackoffMs = Math.min(1500 * Math.pow(2, i), 20000)
                 await new Promise(resolve => setTimeout(resolve, serverErrorBackoffMs))
 
                 continue
@@ -275,7 +298,9 @@ async function selectKey(keys: schema.Key[], model: string): Promise<schema.Key>
 
         if (!coolingEnd || coolingEnd < now) {
             roundRobinIndex = (idx + 1) % len
-            console.info(`selected key sequentially: ${keyCandidate.key}`)
+            console.info(
+                `selected key sequentially: ${maskKey(keyCandidate.key)} (Remark: ${keyCandidate.remark || 'none'}, ID: ${keyCandidate.id})`
+            )
             return keyCandidate
         }
     }
@@ -292,7 +317,9 @@ async function selectKey(keys: schema.Key[], model: string): Promise<schema.Key>
         }
     }
 
-    console.warn(`all keys cooling down, selected best cooling key: ${bestCoolingKey.key}`)
+    console.warn(
+        `all keys cooling down, selected best cooling key: ${maskKey(bestCoolingKey.key)} (Remark: ${bestCoolingKey.remark || 'none'}, ID: ${bestCoolingKey.id})`
+    )
     return bestCoolingKey
 }
 
@@ -397,9 +424,10 @@ async function analyze429CooldownSeconds(
     const count = (consecutive429Count.get(key) || 0) + 1
     consecutive429Count.set(key, count)
 
-    if (count >= Number(env.CONSECUTIVE_429_THRESHOLD)) {
+    const threshold = Number(env.CONSECUTIVE_429_THRESHOLD) || 2
+    if (count >= threshold) {
         consecutive429Count.delete(key)
-        console.error(`key ${key} triggered long cooldown after ${env.CONSECUTIVE_429_THRESHOLD} consecutive 429s`)
+        console.error(`key ${maskKey(key)} triggered long cooldown after ${threshold} consecutive 429s`)
         return untilResetForDay(provider)
     }
 
@@ -430,7 +458,9 @@ async function untilReset(respFromGateway: Response, provider: string): Promise<
 
 async function untilResetForGoogleAiStudio(respFromGateway: Response): Promise<number> {
     try {
-        const errorBody = await respFromGateway.clone().json()
+        const errorBody = (await respFromGateway.clone().json()) as any
+
+        // 1. 优先提取并判断精确的结构化 QuotaFailure 详情
         const quotaFailureDetail = getGoogleAiStudioErrorDetail(
             errorBody,
             'type.googleapis.com/google.rpc.QuotaFailure'
@@ -449,10 +479,30 @@ async function untilResetForGoogleAiStudio(respFromGateway: Response): Promise<n
             }
         }
 
+        // 2. 优先提取 RetryInfo 详情
         const retryInfoDetail = getGoogleAiStudioErrorDetail(errorBody, 'type.googleapis.com/google.rpc.RetryInfo')
         if (retryInfoDetail && retryInfoDetail.retryDelay) {
             const retrySeconds = parseInt(retryInfoDetail.retryDelay.replace('s', ''))
             return retrySeconds + 2 // 2 seconds buffer
+        }
+
+        // 3. 兜底逻辑：若无结构化详情，再通过 message 字符串做临时 IP 限流或分钟限流判断
+        const errorMessage = errorBody?.error?.message || ''
+        const errorStatus = errorBody?.error?.status || ''
+        if (errorStatus === 'RESOURCE_EXHAUSTED') {
+            const msgLower = errorMessage.toLowerCase()
+            if (msgLower.includes('minute') || msgLower.includes('tpm') || msgLower.includes('rpm')) {
+                return 65 // Minute rate limit
+            }
+            if (msgLower.includes('exhausted') || msgLower.includes('quota') || msgLower.includes('day')) {
+                // 如果没有详细的 QuotaFailure 结构，这非常有可能是 Cloudflare 共享出口 IP 触发的临时 IP 限流（即 Key 本身没用完）。
+                // 此时如果直接冷却一整天（直到午夜）会导致正常 Key 被误封一整天，造成严重误判。
+                // 因此，我们对这种简易报错只进行 120 秒的临时冷却，避开当前的临时 IP 频控。
+                console.warn(
+                    `Google AI Studio 429 detected from error message: "${errorMessage}". Cooling down for 120s to bypass temporary IP-rate limit.`
+                )
+                return 120
+            }
         }
     } catch (error) {
         console.error('failed to parse google-ai-studio 429 response, fallback to 65 seconds', error)
