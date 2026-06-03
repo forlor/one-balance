@@ -156,3 +156,7 @@ export function getSecondsUntilMidnightUTC(): number {
     utcMidnight.setUTCHours(0, 0, 0, 0)
     return Math.floor((utcMidnight.getTime() - now.getTime()) / 1000)
 }
+
+export function sanitizeModelName(model: string): string {
+    return model.replace(/[^a-zA-Z0-9_\-\.\/:@]/g, '_')
+}

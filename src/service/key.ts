@@ -1,6 +1,7 @@
 import * as d1 from './d1'
 import * as schema from './d1/schema'
 import * as drizzle from 'drizzle-orm'
+import * as util from '../util'
 
 interface Cache<T> {
     data: T
@@ -61,7 +62,7 @@ export async function setKeyModelCooldownIfAvailable(
     const now = Date.now() / 1000
     const newCooldownEndAt = Math.round(now + sec)
 
-    const modelKey = model.replace(/"/g, '""')
+    const modelKey = util.sanitizeModelName(model)
     const modelPath = `$.\"${modelKey}\"`
     const endAtPath = `$.\"${modelKey}\".end_at`
     const totalSecondsPath = `$.\"${modelKey}\".total_seconds`

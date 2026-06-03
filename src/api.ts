@@ -67,19 +67,15 @@ async function extractRealProviderAndModel(
 async function extractModel(request: Request, restResource: string): Promise<string | null> {
     const pathModel = extractModelFromPath(restResource)
     if (pathModel) {
-        return sanitizeModelName(pathModel)
+        return util.sanitizeModelName(pathModel)
     }
 
     if (request.method === 'POST' && request.body) {
         const model = await extractModelFromBody(request)
-        if (model) return sanitizeModelName(model)
+        if (model) return util.sanitizeModelName(model)
     }
 
     return null
-}
-
-function sanitizeModelName(model: string): string {
-    return model.replace(/[^a-zA-Z0-9_\-\.\/:@]/g, '_')
 }
 
 function maskKey(key: string): string {
@@ -132,23 +128,25 @@ async function forward(
             const bodyStr = new TextDecoder().decode(body)
             const data = JSON.parse(bodyStr) as any
 
-            // 1. Native Format (generationConfig)
-            if (data.generationConfig && typeof data.generationConfig === 'object') {
-                delete data.generationConfig.temperature
-                delete data.generationConfig.topP
-                delete data.generationConfig.topK
-                if (Object.keys(data.generationConfig).length === 0) {
-                    delete data.generationConfig
+            if (data && typeof data === 'object' && !Array.isArray(data)) {
+                // 1. Native Format (generationConfig)
+                if (data.generationConfig && typeof data.generationConfig === 'object') {
+                    delete data.generationConfig.temperature
+                    delete data.generationConfig.topP
+                    delete data.generationConfig.topK
+                    if (Object.keys(data.generationConfig).length === 0) {
+                        delete data.generationConfig
+                    }
                 }
+
+                // 2. OpenAI Compatible / Common top-level properties
+                if ('temperature' in data) delete data.temperature
+                if ('top_p' in data) delete data.top_p
+                if ('top_k' in data) delete data.top_k
+
+                body = new TextEncoder().encode(JSON.stringify(data))
+                console.info(`[Gemini 3 Param Stripper] Successfully removed temperature/top_p/top_k from model ${model} request body to optimize reasoning.`)
             }
-
-            // 2. OpenAI Compatible / Common top-level properties
-            if ('temperature' in data) delete data.temperature
-            if ('top_p' in data) delete data.top_p
-            if ('top_k' in data) delete data.top_k
-
-            body = new TextEncoder().encode(JSON.stringify(data))
-            console.info(`[Gemini 3 Param Stripper] Successfully removed temperature/top_p/top_k from model ${model} request body to optimize reasoning.`)
         } catch (e) {
             console.error(`[Gemini 3 Param Stripper] Failed to parse or modify Gemini 3 request body for model ${model}`, e)
         }
@@ -160,13 +158,15 @@ async function forward(
         }
 
         const selectedKey = await selectKey(activeKeys, model)
+        const controller = new AbortController()
         const reqToGateway = await makeGatewayRequest(
             request.method,
             request.headers,
             body,
             env,
             restResource,
-            selectedKey.key
+            selectedKey.key,
+            controller.signal
         )
         const respFromGateway = await fetch(reqToGateway)
         const status = respFromGateway.status
@@ -238,21 +238,15 @@ async function forward(
             case 504:
                 let timerId: any
                 const timeoutPromise = new Promise<string>(resolve => {
-                    timerId = setTimeout(() => resolve('<timeout reading body>'), 1000)
+                    timerId = setTimeout(() => {
+                        controller.abort() // Instantly cancels the response text stream and network request
+                        resolve('<timeout reading body>')
+                    }, 1000)
                 })
 
                 const serverErrorText = await Promise.race([respFromGateway.text(), timeoutPromise]).catch(() => '')
 
                 clearTimeout(timerId)
-
-                if (serverErrorText === '<timeout reading body>') {
-                    try {
-                        const bodyCancelPromise = respFromGateway.body?.cancel().catch(() => {})
-                        if (bodyCancelPromise) {
-                            ctx.waitUntil(bodyCancelPromise)
-                        }
-                    } catch {}
-                }
 
                 console.error(`gateway returned ${status} ${serverErrorText}`)
 
@@ -360,7 +354,8 @@ async function makeGatewayRequest(
     body: ArrayBuffer | null,
     env: Env,
     restResource: string,
-    key: string
+    key: string,
+    signal?: AbortSignal
 ): Promise<Request> {
     const newHeaders = new Headers(headers)
     setAuthHeader(newHeaders, restResource, key)
@@ -393,7 +388,8 @@ async function makeGatewayRequest(
         method: method,
         headers: newHeaders,
         body: body,
-        redirect: 'follow'
+        redirect: 'follow',
+        signal: signal
     })
 }
 
