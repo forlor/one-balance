@@ -123,7 +123,36 @@ async function forward(
     // without altering the cached list structure for other requests.
     const activeKeys = [...cachedKeys]
 
-    const body = request.body ? await request.arrayBuffer() : null
+    let body = request.body ? await request.arrayBuffer() : null
+
+    // For all Gemini 3.x models from Google AI Studio, strip temperature, top_p, and top_k to let Gemini 3's reasoning engine run with optimized defaults.
+    const isGemini3 = provider === 'google-ai-studio' && model.toLowerCase().includes('gemini-3')
+    if (isGemini3 && body) {
+        try {
+            const bodyStr = new TextDecoder().decode(body)
+            const data = JSON.parse(bodyStr) as any
+
+            // 1. Native Format (generationConfig)
+            if (data.generationConfig && typeof data.generationConfig === 'object') {
+                delete data.generationConfig.temperature
+                delete data.generationConfig.topP
+                delete data.generationConfig.topK
+                if (Object.keys(data.generationConfig).length === 0) {
+                    delete data.generationConfig
+                }
+            }
+
+            // 2. OpenAI Compatible / Common top-level properties
+            if ('temperature' in data) delete data.temperature
+            if ('top_p' in data) delete data.top_p
+            if ('top_k' in data) delete data.top_k
+
+            body = new TextEncoder().encode(JSON.stringify(data))
+            console.info(`[Gemini 3 Param Stripper] Successfully removed temperature/top_p/top_k from model ${model} request body to optimize reasoning.`)
+        } catch (e) {
+            console.error(`[Gemini 3 Param Stripper] Failed to parse or modify Gemini 3 request body for model ${model}`, e)
+        }
+    }
     const MAX_RETRIES = Number(env.MAX_RETRIES) || 4
     for (let i = 0; i < MAX_RETRIES; i++) {
         if (activeKeys.length === 0) {
