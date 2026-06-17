@@ -145,10 +145,15 @@ async function forward(
                 if ('top_k' in data) delete data.top_k
 
                 body = new TextEncoder().encode(JSON.stringify(data))
-                console.info(`[Gemini 3 Param Stripper] Successfully removed temperature/top_p/top_k from model ${model} request body to optimize reasoning.`)
+                console.info(
+                    `[Gemini 3 Param Stripper] Successfully removed temperature/top_p/top_k from model ${model} request body to optimize reasoning.`
+                )
             }
         } catch (e) {
-            console.error(`[Gemini 3 Param Stripper] Failed to parse or modify Gemini 3 request body for model ${model}`, e)
+            console.error(
+                `[Gemini 3 Param Stripper] Failed to parse or modify Gemini 3 request body for model ${model}`,
+                e
+            )
         }
     }
     const MAX_RETRIES = Number(env.MAX_RETRIES) || 4
@@ -226,9 +231,13 @@ async function forward(
                     activeKeys.splice(coolingIndex, 1)
                 }
 
-                // Wait with a longer exponential backoff before retrying to prevent hammering the upstream API (starting at 1500ms, scaling by 2x, max 20s)
-                const backoffMs = Math.min(1500 * Math.pow(2, i), 20000)
-                await new Promise(resolve => setTimeout(resolve, backoffMs))
+                // Only back off when another retry will actually follow. On the final
+                // attempt the loop exits and returns 500 to the caller, so sleeping just
+                // adds pointless latency for no benefit.
+                if (i < MAX_RETRIES - 1) {
+                    const backoffMs = Math.min(1500 * Math.pow(2, i), 20000)
+                    await new Promise(resolve => setTimeout(resolve, backoffMs))
+                }
 
                 continue
 
@@ -256,9 +265,12 @@ async function forward(
                     activeKeys.splice(errorIndex, 1)
                 }
 
-                // Wait with a longer exponential backoff before retrying on server errors (starting at 1500ms, scaling by 2x, max 20s)
-                const serverErrorBackoffMs = Math.min(1500 * Math.pow(2, i), 20000)
-                await new Promise(resolve => setTimeout(resolve, serverErrorBackoffMs))
+                // Only back off when another retry will actually follow (see the 429 case
+                // above for rationale).
+                if (i < MAX_RETRIES - 1) {
+                    const serverErrorBackoffMs = Math.min(1500 * Math.pow(2, i), 20000)
+                    await new Promise(resolve => setTimeout(resolve, serverErrorBackoffMs))
+                }
 
                 continue
         }
@@ -307,31 +319,57 @@ function getAuthKeyFromHeader(request: Request, provider: string, restResource?:
     return v
 }
 
-let roundRobinIndex = 0
+// Round-robin cursor per provider+model. The cursor is meaningful WITHIN a single
+// cache window: the cached array order is frozen between refreshes, so an index maps
+// to the same key for the window's lifetime and the cursor rotates requests evenly
+// (preventing concurrent requests on one instance from all hitting the head key).
+// Across refreshes the array is reshuffled by RANDOM() in listActiveKeysViaCache, so
+// the cursor's cross-refresh continuity is intentionally lost — that's fine, the whole
+// array was just reshuffled. If the cursor is stale (>= length after a refresh with a
+// different key count), it simply wraps around.
+const roundRobinIndexByModel: Map<string, number> = new Map()
 
 async function selectKey(keys: schema.Key[], model: string): Promise<schema.Key> {
     const now = Date.now() / 1000
     const len = keys.length
 
-    // 1. Try to find an available (non-cooling) key sequentially (Round-Robin)
-    for (let i = 0; i < len; i++) {
-        const idx = (roundRobinIndex + i) % len
-        const keyCandidate = keys[idx]
-        const coolingEnd = keyCandidate.modelCoolings?.[model]?.end_at
+    const cursorKey = model
+    let cursor = roundRobinIndexByModel.get(cursorKey) ?? 0
+    if (cursor >= len) cursor = 0
 
-        if (!coolingEnd || coolingEnd < now) {
-            roundRobinIndex = (idx + 1) % len
+    // A key is "cooling" for this model if its cooldown end_at is still in the future.
+    // Cooldown lookups are normalized (no "models/" prefix) via util.sanitizeModelName,
+    // so they can't be missed due to spelling drift.
+    const isCooling = (k: schema.Key) => {
+        const end = k.modelCoolings?.[model]?.end_at
+        return !!end && end >= now
+    }
+
+    // Pure round-robin: walk up to `len` steps from the cursor and pick the first key
+    // that isn't currently cooling down for this model. Advancing the cursor on every
+    // pick spreads load evenly across all available keys — this is the main lever for
+    // keeping 429s low on Google AI Studio, where each free key has tight per-day quotas.
+    // We intentionally do NOT weight by totalCoolingSeconds here: that value is
+    // monotonically increasing (never decays), so weighting by it permanently sidelines
+    // any key that ever hit a daily quota, concentrating load on the remaining few and
+    // *causing* more 429s rather than preventing them.
+    for (let i = 0; i < len; i++) {
+        const idx = (cursor + i) % len
+        const candidate = keys[idx]
+        if (!isCooling(candidate)) {
+            roundRobinIndexByModel.set(cursorKey, (idx + 1) % len)
             console.info(
-                `selected key sequentially: ${maskKey(keyCandidate.key)} (Remark: ${keyCandidate.remark || 'none'}, ID: ${keyCandidate.id})`
+                `selected key via round-robin: ${maskKey(candidate.key)} (Remark: ${candidate.remark || 'none'}, ID: ${candidate.id})`
             )
-            return keyCandidate
+            return candidate
         }
     }
 
-    // 2. Fallback: If all keys are cooling down, pick the one with the earliest cooldown end
+    // Fallback: all keys are cooling for this model — pick the one that recovers
+    // earliest so the next request resumes soonest. Don't advance the cursor here,
+    // because no normal pick happened.
     let bestCoolingKey: schema.Key = keys[0]
     let earliestCooldownEnd = Infinity
-
     for (const key of keys) {
         const coolingEnd = key.modelCoolings?.[model]?.end_at || 0
         if (coolingEnd < earliestCooldownEnd) {
@@ -339,9 +377,8 @@ async function selectKey(keys: schema.Key[], model: string): Promise<schema.Key>
             bestCoolingKey = key
         }
     }
-
     console.warn(
-        `all keys cooling down, selected best cooling key: ${maskKey(bestCoolingKey.key)} (Remark: ${bestCoolingKey.remark || 'none'}, ID: ${bestCoolingKey.id})`
+        `all keys cooling down for ${model}, selected earliest-recovery key: ${maskKey(bestCoolingKey.key)} (Remark: ${bestCoolingKey.remark || 'none'}, ID: ${bestCoolingKey.id})`
     )
     return bestCoolingKey
 }

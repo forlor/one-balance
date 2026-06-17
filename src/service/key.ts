@@ -22,11 +22,21 @@ export async function listActiveKeysViaCache(env: Env, provider: string): Promis
     }
 
     // may thundering herd, but it should be enough
+    // Order RANDOM() so each cache refresh reshuffles the key array. This works
+    // together with selectKey's round-robin cursor as a two-layer load spread:
+    //   - long term (across refreshes): RANDOM() makes sure no key is permanently
+    //     favored or starved by a fixed ordering (e.g. lowest id always picked first);
+    //   - short term (within one cache window, ~60s): the array order is frozen, so
+    //     the cursor's index->key mapping stays valid and round-robin rotates evenly,
+    //     preventing concurrent requests on the same instance from hammering the head.
+    // The cursor loses its cross-refresh continuity (index N points at a different key
+    // after a refresh), but that is harmless — the whole array was just reshuffled.
     const keys = (await d1.db(env).query.keys.findMany({
         columns: {
             id: true,
             key: true,
-            modelCoolings: true
+            modelCoolings: true,
+            remark: true
         },
         where: drizzle.and(drizzle.eq(schema.keys.status, 'active'), drizzle.eq(schema.keys.provider, provider)),
         orderBy: drizzle.sql`RANDOM()`,
@@ -170,6 +180,17 @@ export async function addKeys(env: Env, keys: KeyForAdd[]) {
     for (let i = 0; i < keys.length; i += chunkSize) {
         const chunk = keys.slice(i, i + chunkSize)
         await db.insert(schema.keys).values(chunk).onConflictDoNothing()
+    }
+
+    // Invalidate the cache so newly added keys become visible immediately instead of
+    // after the cache TTL. The next listActiveKeysViaCache refresh will reshuffle
+    // (RANDOM()), so new keys get a fair turn right away.
+    const providers = new Set(keys.map(k => k.provider))
+    for (const provider of providers) {
+        const cache = activeKeysCacheByProvider.get(provider)
+        if (cache) {
+            cache.isDirty = true
+        }
     }
 }
 
