@@ -395,6 +395,7 @@ async function makeGatewayRequest(
     signal?: AbortSignal
 ): Promise<Request> {
     const newHeaders = new Headers(headers)
+    stripClientIpHeaders(newHeaders)
     setAuthHeader(newHeaders, restResource, key)
 
     const selected = selectGateway(env)
@@ -428,6 +429,25 @@ async function makeGatewayRequest(
         redirect: 'follow',
         signal: signal
     })
+}
+
+function stripClientIpHeaders(headers: Headers) {
+    const clientIpHeaders = [
+        'CF-Connecting-IP',
+        'CF-Connecting-IPv6',
+        'Fastly-Client-IP',
+        'Forwarded',
+        'True-Client-IP',
+        'X-Client-IP',
+        'X-Cluster-Client-IP',
+        'X-Forwarded',
+        'X-Forwarded-For',
+        'X-Real-IP'
+    ]
+
+    for (const header of clientIpHeaders) {
+        headers.delete(header)
+    }
 }
 
 function selectGateway(env: Env): string {
